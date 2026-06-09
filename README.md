@@ -17,9 +17,19 @@ window, no browser.
 - Mac **asleep** (lid closed) at 6:30pm? It catches up as soon as you wake it.
 - Mac **shut off** at 6:30pm? It catches up the next time you log in.
 
-**Update it right now.** Double-click `refresh.command` in this folder. A
-window opens and shows what it's doing; when it says "Published", the website
-has the new data about a minute later. Press Enter to close the window.
+**Restarting your computer: nothing to do.** The updater is registered with
+macOS itself (in `~/Library/LaunchAgents`), so it comes back automatically
+every time you log in — it also does a check right at login and refreshes
+then if an update was missed. There is nothing to launch, start, or
+double-click after a restart. This keeps working until you deliberately
+remove it (see "launchd install" below); restarts, updates to macOS, and
+weeks of the Mac being off don't break it.
+
+**Update it right now (optional).** Double-click `refresh.command` in this
+folder. A window opens and shows what it's doing; when it says "Published",
+the website has the new data about a minute later. Press Enter to close the
+window. You never *have* to do this — it's only for when you don't want to
+wait for the automatic update.
 
 **How to tell it's working.** The website header says "Updated 2h ago" (etc).
 If that number ever looks too old, double-click `refresh.command`.
@@ -61,6 +71,14 @@ The agent runs daily at 18:30 and once at every login (the `--if-stale` guard
 makes login runs a no-op when data is fresh). After editing the plist, reload:
 `launchctl bootout gui/$UID/com.georgeryang.r-music-radar`, then the two
 commands above again.
+
+Lifecycle: installing is one-time. launchd reloads every plist in
+`~/Library/LaunchAgents` at each login, so the agent survives restarts,
+shutdowns, and macOS updates with no action needed. It only stops if the
+plist is removed from `~/Library/LaunchAgents`, you run `launchctl bootout`,
+or this repo folder moves/renames (the plist points at absolute paths —
+reinstall with updated paths if you move the project). To check it's loaded:
+`launchctl list | grep r-music-radar`.
 
 Run it on demand: `launchctl kickstart gui/$UID/com.georgeryang.r-music-radar`
 Logs: `~/Library/Logs/r-music-radar.log`
