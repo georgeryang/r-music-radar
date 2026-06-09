@@ -1,0 +1,13 @@
+{
+  "name": "Music Radar",
+  "short_name": "Radar",
+  "start_url": "/r-music-radar/",
+  "scope": "/r-music-radar/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
