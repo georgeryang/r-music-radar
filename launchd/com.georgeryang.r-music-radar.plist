@@ -8,6 +8,7 @@
   <array>
     <string>/bin/bash</string>
     <string>/Users/gyang/Dev/r-music-radar/scripts/update.sh</string>
+    <string>--if-stale</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -25,7 +26,9 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
+  <!-- Runs at every login; the --if-stale guard makes it a no-op unless the
+       18:30 run was missed because the Mac was powered off. -->
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
 </dict>
 </plist>
