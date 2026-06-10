@@ -53,6 +53,8 @@ function parseAtomEntries(xml, category) {
   return posts
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 function fetchFlair(subreddit, flair) {
   const url = 'https://www.reddit.com/r/' + subreddit + '/search.rss?q=' +
     encodeURIComponent(flair.query) + '&sort=new&restrict_sr=on&t=day&limit=100'
@@ -87,13 +89,48 @@ function fetchFlair(subreddit, flair) {
   })
 }
 
+// Reddit soft-throttles bursts of search requests by returning a valid but
+// EMPTY feed with HTTP 200 — indistinguishable from "no posts today". So:
+// requests run sequentially with spacing (never as a concurrent burst), and an
+// empty result is retried with backoff just like a failed one. A flair that is
+// genuinely empty costs two extra polite requests; a throttled one recovers.
+async function fetchFlairWithRetry(subreddit, flair) {
+  const delays = [0, 5000, 15000]
+  let last = null
+  for (const delay of delays) {
+    if (delay) {
+      console.log('Retrying ' + subreddit + '/' + flair.category + ' in ' + delay / 1000 + 's (empty or failed)')
+      await sleep(delay)
+    }
+    last = await fetchFlair(subreddit, flair)
+    if (last && last.length > 0) return last
+  }
+  return last
+}
+
 async function fetchSubreddit(subreddit) {
   const flairs = FLAIR_MAP[subreddit]
-  const results = await Promise.all(flairs.map(f => fetchFlair(subreddit, f)))
+  const results = []
+  for (const flair of flairs) {
+    results.push(await fetchFlairWithRetry(subreddit, flair))
+    // Randomized gap between requests so the sequence has no fixed rhythm.
+    await sleep(800 + Math.floor(Math.random() * 1900))
+  }
 
-  const failures = results.filter(r => r === null).length
-  const allFailed = failures === flairs.length
-  if (allFailed) console.error('All fetches failed for r/' + subreddit)
+  // A category is "suspect" when every query feeding it came back failed or
+  // empty — main() then carries over recent existing posts instead of wiping it.
+  const categoryHits = {}
+  flairs.forEach((flair, i) => {
+    const got = results[i] !== null && results[i].length > 0
+    categoryHits[flair.category] = categoryHits[flair.category] || got
+  })
+  const emptyCategories = Object.keys(categoryHits).filter(c => !categoryHits[c])
+
+  // If nothing at all came back, treat it as a total failure even when every
+  // response was a "successful" empty feed — a full throttle must not stamp
+  // the data as fresh, or --if-stale would suppress retries for 12h.
+  const allFailed = emptyCategories.length === Object.keys(categoryHits).length
+  if (allFailed) console.error('All fetches failed or empty for r/' + subreddit)
 
   const seen = new Set()
   const posts = []
@@ -107,7 +144,7 @@ async function fetchSubreddit(subreddit) {
     }
   }
 
-  return { posts, allFailed }
+  return { posts, allFailed, emptyCategories }
 }
 
 async function main() {
@@ -115,21 +152,41 @@ async function main() {
   await fs.mkdir(dataDir, { recursive: true })
 
   const subreddits = Object.keys(FLAIR_MAP)
-  const results = await Promise.all(subreddits.map(s => fetchSubreddit(s)))
 
   let anyTotalFailure = false
-  await Promise.all(subreddits.map(async (subreddit, i) => {
-    const { posts, allFailed } = results[i]
+  for (const subreddit of subreddits) {
+    const { posts, allFailed, emptyCategories } = await fetchSubreddit(subreddit)
     const filePath = path.join(dataDir, subreddit + '.json')
     if (allFailed) {
       anyTotalFailure = true
       console.error('Skipped ' + filePath + ' (all flairs failed — keeping existing)')
-      return
+      continue
     }
+
+    // Carry over still-recent existing posts for categories the search came
+    // back empty on. A post under 24h old that we fetched earlier would still
+    // match the t=day search if it were working — so an empty result there is
+    // a throttle artifact, not a real "nothing new".
+    if (emptyCategories.length > 0) {
+      const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600
+      try {
+        const existing = JSON.parse(await fs.readFile(filePath, 'utf8'))
+        let carried = 0
+        for (const post of existing.posts) {
+          if (emptyCategories.includes(post.category) && post.created_utc >= cutoff &&
+              !posts.some(p => p.url === post.url)) {
+            posts.push(post)
+            carried++
+          }
+        }
+        if (carried > 0) console.log('Carried over ' + carried + ' existing posts for empty categories (' + emptyCategories.join(', ') + ')')
+      } catch { /* no existing file — nothing to carry over */ }
+    }
+
     const data = { fetched_at: Date.now(), posts }
     await fs.writeFile(filePath, JSON.stringify(data))
     console.log('Wrote ' + filePath + ' (' + posts.length + ' posts)')
-  }))
+  }
 
   // Exit non-zero if any subreddit had every flair fail, so update.sh logs the
   // failure instead of silently reporting "no changes".

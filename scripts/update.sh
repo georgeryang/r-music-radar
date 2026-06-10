@@ -18,20 +18,30 @@ if [ -z "$NODE" ]; then
   exit 1
 fi
 
-# --if-stale (passed by launchd): skip unless the last fetch is >20h old. Lets
-# RunAtLoad catch up after a powered-off 18:30 without refetching on every login.
+# --if-stale (passed by launchd): one fetch per day, anchored to 18:15 KST
+# (Korean evening release time). Stale = the last fetch predates the most
+# recent 18:15 KST. KST is UTC+9 with no DST, so this is pure UTC arithmetic —
+# independent of the Mac's local timezone. launchd ticks every 10 min while
+# awake (and once on wake), so the fetch lands in the 18:15–18:30 KST window
+# when the Mac is awake, or at first wake after it.
 if [ "${1:-}" = "--if-stale" ]; then
-  AGE_HOURS="$("$NODE" -p '
-    try {
-      const { fetched_at } = JSON.parse(require("fs").readFileSync("docs/data/kpop.json", "utf8"));
-      Math.floor((Date.now() - fetched_at) / 3600000);
-    } catch { 999 }
-  ' 2>/dev/null || echo 999)"
-  if [ "$AGE_HOURS" -lt 20 ] 2>/dev/null; then
-    log "Data is fresh (${AGE_HOURS}h old) — skipping"
-    exit 0
+  STALE="$("$NODE" -e '
+    const KST = 9 * 3600e3, DAY = 86400e3, SLOT = (18 * 60 + 15) * 60e3;
+    const kstNow = Date.now() + KST;
+    let slot = Math.floor(kstNow / DAY) * DAY + SLOT;
+    if (slot > kstNow) slot -= DAY;
+    let fetchedAt = 0;
+    try { fetchedAt = JSON.parse(require("fs").readFileSync("docs/data/kpop.json", "utf8")).fetched_at } catch {}
+    process.stdout.write(fetchedAt < slot - KST ? "1" : "0");
+  ' 2>/dev/null || echo 1)"
+  if [ "$STALE" != "1" ]; then
+    exit 0  # silent: ticks run every 10 min, logging each skip would flood the log
   fi
-  log "Data is stale (${AGE_HOURS}h old) — refreshing"
+  # Jitter 0-7 min so the fetch never lands at a machine-regular moment.
+  # Manual runs (refresh.command) skip this branch entirely.
+  JITTER=$((RANDOM % 420))
+  log "Last fetch predates the 18:15 KST slot — refreshing in ${JITTER}s"
+  sleep "$JITTER"
 fi
 
 log "Fetching Reddit data..."

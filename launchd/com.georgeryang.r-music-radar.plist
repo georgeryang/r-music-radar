@@ -10,13 +10,14 @@
     <string>/Users/gyang/Dev/r-music-radar/scripts/update.sh</string>
     <string>--if-stale</string>
   </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>18</integer>
-    <key>Minute</key>
-    <integer>30</integer>
-  </dict>
+  <!-- 10-minute tick. launchd fires a missed tick once when the Mac wakes
+       from sleep, so this doubles as the wake-up trigger. The --if-stale
+       guard in update.sh turns ticks into exactly one fetch per day, in the
+       18:15-18:30 KST window when awake or at first wake after it. A fixed
+       StartCalendarInterval can't do this: it uses the Mac's local timezone,
+       which drifts against KST with DST and travel. -->
+  <key>StartInterval</key>
+  <integer>600</integer>
   <key>StandardOutPath</key>
   <string>/Users/gyang/Library/Logs/r-music-radar.log</string>
   <key>StandardErrorPath</key>
@@ -26,8 +27,8 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
-  <!-- Runs at every login; the --if-stale guard makes it a no-op unless the
-       18:30 run was missed because the Mac was powered off. -->
+  <!-- Runs at every login/boot; the --if-stale guard makes it a no-op unless
+       the data is stale (e.g. the Mac was powered off past a tick). -->
   <key>RunAtLoad</key>
   <true/>
 </dict>
