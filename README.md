@@ -42,13 +42,14 @@ If that number ever looks too old, double-click `refresh.command`.
 
 ## How it fits together
 
-Successor to r-music-tracker. Data comes from Reddit's search RSS feeds
-(the JSON API and all cloud fetching get blocked — only local fetching from a
-residential IP works), published daily by launchd, served as static files
+Successor to r-music-tracker. Data comes from old.reddit.com's HTML `/new`
+listings (the JSON API and all cloud fetching get blocked, and per-flair RSS
+searches get rate-limited with HTTP 429 — only low-volume local fetching from
+a residential IP works), published daily by launchd, served as static files
 from GitHub Pages.
 
-- `scripts/fetch-reddit.mjs` — fetches each flair's RSS feed via curl, writes `docs/data/{kpop,popheads}.json`. Zero dependencies. Requests run one at a time with randomized gaps, retry when a response comes back empty, and carry over recent posts for a category that stays empty — Reddit soft-throttles bursts by returning a *valid empty feed with HTTP 200*, so an empty result can't be trusted at face value.
-- `scripts/update.sh` — fetch, then commit + push `docs/data` if anything changed. launchd runs it with `--if-stale`, which exits early (silently) unless the last fetch predates the most recent 18:15 KST — that's what turns frequent ticks into one fetch per day and makes wake/login catch-up free. Stale runs wait a random 0–7 min before fetching. KST is UTC+9 with no DST, so the check is plain UTC arithmetic, independent of the Mac's timezone.
+- `scripts/fetch-reddit.mjs` — fetches each subreddit's `/new` listing from old.reddit.com via curl (one request per subreddit, plus one more page when 100 posts don't cover 24h), reads each post's flair from the HTML, and writes `docs/data/{kpop,popheads}.json`. Zero dependencies. Requests run one at a time with randomized gaps; a response with no parseable posts is retried with backoff (Reddit's throttle artifacts can look like a "successful" empty page), and recent posts from the previous file are carried over so a truncated fetch never drops posts we already had.
+- `scripts/update.sh` — fetch, then commit + push `docs/data` if anything changed — including partial data when one subreddit failed, so a good fetch is never held hostage by a bad one. launchd runs it with `--if-stale`, which exits early (silently) unless the oldest data file predates the most recent 18:15 KST — that's what turns frequent ticks into one fetch per day, makes wake/login catch-up free, and retries later the same day after a partial failure. Stale runs wait a random 0–7 min before fetching. KST is UTC+9 with no DST, so the check is plain UTC arithmetic, independent of the Mac's timezone.
 - `refresh.command` — double-clickable wrapper around `update.sh` (no `--if-stale`, so it always fetches).
 - `docs/` — the GitHub Pages root (Settings → Pages → main branch, /docs folder). Contains the built app **and** the data. Builds never touch `docs/data` (`emptyOutDir: false`), so the launchd job needs no node_modules.
 - `src/` — Vite + React + Tailwind + shadcn frontend. Data is fetched client-side, so data updates need no rebuild.
@@ -93,7 +94,7 @@ ticks are silent), so one entry per day is healthy, not broken.
 
 ## Troubleshooting
 
-- **Fetch fails with HTTP 403/429:** Reddit is rate-limiting; it usually passes on the next run. The script keeps existing data when all flairs for a subreddit fail.
-- **A category looks empty when Reddit clearly has posts:** Reddit soft-throttled the search — it returns an empty feed with HTTP 200. The script retries and carries over recent posts; `Carried over N existing posts` in the log means this is happening. If it persists across days, the fetch may need longer gaps between requests.
+- **Fetch fails with HTTP 403/429:** Reddit is rate-limiting; it usually passes on the next run. The script keeps a subreddit's existing data when its fetch fails, publishes whatever else succeeded, and the `--if-stale` guard retries the failed subreddit on a later tick the same day.
+- **A category looks empty when Reddit clearly has posts:** check the post's flair on old.reddit.com — only flairs in `FLAIR_MAP` (matched exactly, brackets included) are kept. If the subreddit renamed a flair, update the map. `Carried over N existing posts` in the log is normal after a partial fetch.
 - **Push fails from launchd:** make sure the SSH key works without a prompt: `ssh-add --apple-use-keychain ~/.ssh/id_ed25519`.
 - **Site shows stale data:** GitHub Pages deploys take ~1 minute after push; the app cache-busts with `?v=`, so a reload after that is enough.

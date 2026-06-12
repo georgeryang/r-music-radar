@@ -30,8 +30,15 @@ if [ "${1:-}" = "--if-stale" ]; then
     const kstNow = Date.now() + KST;
     let slot = Math.floor(kstNow / DAY) * DAY + SLOT;
     if (slot > kstNow) slot -= DAY;
+    // Oldest of the two files: a run where one subreddit failed leaves that
+    // file stale, so later ticks retry the same day instead of waiting for
+    // tomorrow'\''s slot.
     let fetchedAt = 0;
-    try { fetchedAt = JSON.parse(require("fs").readFileSync("docs/data/kpop.json", "utf8")).fetched_at } catch {}
+    for (const sub of ["kpop", "popheads"]) {
+      let t = 0;
+      try { t = JSON.parse(require("fs").readFileSync("docs/data/" + sub + ".json", "utf8")).fetched_at } catch {}
+      if (fetchedAt === 0 || t < fetchedAt) fetchedAt = t;
+    }
     process.stdout.write(fetchedAt < slot - KST ? "1" : "0");
   ' 2>/dev/null || echo 1)"
   if [ "$STALE" != "1" ]; then
@@ -45,14 +52,17 @@ if [ "${1:-}" = "--if-stale" ]; then
 fi
 
 log "Fetching Reddit data..."
+FETCH_FAILED=0
 if ! "$NODE" scripts/fetch-reddit.mjs; then
-  log "ERROR: fetch failed for at least one subreddit (kept existing data)"
-  exit 1
+  # Don't bail: one subreddit failing shouldn't hold the other's data hostage.
+  # Publish whatever was written, then exit non-zero so the failure is logged.
+  log "ERROR: fetch failed for at least one subreddit (publishing partial data)"
+  FETCH_FAILED=1
 fi
 
 if git diff --quiet docs/data && [ -z "$(git ls-files --others --exclude-standard docs/data)" ]; then
   log "No changes — nothing to publish"
-  exit 0
+  exit "$FETCH_FAILED"
 fi
 
 log "Publishing..."
@@ -60,3 +70,4 @@ git add docs/data
 git commit -m "Update data $(date '+%Y-%m-%d %H:%M')" || { log "ERROR: commit failed"; exit 1; }
 git push || { log "ERROR: push failed"; exit 1; }
 log "Published"
+exit "$FETCH_FAILED"

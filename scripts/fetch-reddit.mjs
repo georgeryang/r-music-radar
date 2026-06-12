@@ -2,24 +2,33 @@ import { exec } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-// Reddit blocks unauthenticated .json with browser-style UAs (returns 403 + HTML wall).
-// .rss still serves anonymously with a short, non-browser UA. Keep this string unique.
+// Reddit blocks unauthenticated .json with browser-style UAs (returns 403 + HTML
+// wall), and heavily rate-limits bursts of search.rss queries (HTTP 429). The
+// old.reddit.com HTML listing still serves anonymously with a short non-browser
+// UA, and unlike RSS it includes each post's flair — so ONE request per
+// subreddit replaces one search per flair. Keep the UA string unique.
 const UA = 'r-music-tracker/1.0'
 
+// Exact flair label (as rendered on old.reddit) → category. Posts with any
+// other flair are ignored. Exact matching also fixes the search-era bug where
+// flair:"[FRESH]" fuzzy-matched "[FRESH ALBUM]" posts into the song category.
 const FLAIR_MAP = {
-  kpop: [
-    { query: 'flair:"MV"', category: 'mv' },
-    { query: 'flair:"Album Discussion"', category: 'album' },
-    { query: 'flair:"Audio"', category: 'song' },
-    { query: 'flair:"Teaser"', category: 'teaser' }
-  ],
-  popheads: [
-    { query: 'flair:"fresh video"', category: 'mv' },
-    { query: 'flair:"fresh album"', category: 'album' },
-    { query: 'flair:"fresh ep"', category: 'album' },
-    { query: 'flair:"[FRESH]"', category: 'song' }
-  ]
+  kpop: {
+    '[MV]': 'mv',
+    '[Album Discussion]': 'album',
+    '[Audio]': 'song',
+    '[Teaser]': 'teaser'
+  },
+  popheads: {
+    '[FRESH VIDEO]': 'mv',
+    '[FRESH ALBUM]': 'album',
+    '[FRESH EP]': 'album',
+    '[FRESH]': 'song'
+  }
 }
+
+const WINDOW_SECONDS = 24 * 3600 // same horizon the old t=day searches had
+const MAX_PAGES = 3 // 100 posts/page; r/kpop can exceed 100 posts in 24h
 
 const HTML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'", '#32': ' ' }
 function decodeEntities(s) {
@@ -30,165 +39,164 @@ function decodeEntities(s) {
   })
 }
 
-function parseAtomEntries(xml, category) {
+// Each post on an old.reddit listing is a div.thing whose opening tag carries
+// data-timestamp / data-permalink / data-fullname attributes; flair, title and
+// thumbnail live in the markup between one opening tag and the next.
+function parseListing(html, flairMap) {
+  const tags = [...html.matchAll(/<div class="([^"]*\bthing\b[^"]*)"[^>]*>/g)]
   const posts = []
-  const entryRe = /<entry>([\s\S]*?)<\/entry>/g
-  let match
-  while ((match = entryRe.exec(xml)) !== null) {
-    const entry = match[1]
-    const title = (entry.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || ''
-    const linkHref = (entry.match(/<link[^>]*href="([^"]+)"/) || [])[1] || ''
-    const published = (entry.match(/<published>([^<]+)<\/published>/) || [])[1] || ''
-    const thumb = (entry.match(/<media:thumbnail[^>]*url="([^"]+)"/) || [])[1] || ''
+  let lastFullname = ''
+  let oldestUtc = Infinity
 
-    if (!linkHref) continue
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i][0]
+    const classAttr = tags[i][1]
+    const body = html.slice(tags[i].index, i + 1 < tags.length ? tags[i + 1].index : html.length)
+
+    const fullname = (tag.match(/data-fullname="([^"]+)"/) || [])[1] || ''
+    if (fullname) lastFullname = fullname
+    if (/\bpromoted\b/.test(classAttr)) continue // ads
+
+    const timestamp = (tag.match(/data-timestamp="(\d+)"/) || [])[1]
+    const permalink = (tag.match(/data-permalink="([^"]+)"/) || [])[1]
+    if (!timestamp || !permalink) continue
+    const createdUtc = Math.floor(Number(timestamp) / 1000)
+    if (createdUtc < oldestUtc) oldestUtc = createdUtc
+
+    const flair = (body.match(/linkflairlabel[^>]*title="([^"]*)"/) || [])[1] || ''
+    const category = flairMap[decodeEntities(flair)]
+    if (!category) continue
+
+    const titleHtml = (body.match(/<a class="title[^"]*"[^>]*>([\s\S]*?)<\/a>/) || [])[1] || ''
+    const thumb = (body.match(/<a class="thumbnail[^"]*"[^>]*>\s*<img src="([^"]*)"/) || [])[1] || ''
+
     posts.push({
-      title: decodeEntities(title),
-      url: linkHref.replace(/&amp;/g, '&'),
-      created_utc: Math.floor(new Date(published).getTime() / 1000),
-      thumbnail: thumb ? thumb.replace(/&amp;/g, '&') : '',
+      title: decodeEntities(titleHtml.replace(/<[^>]*>/g, '')),
+      url: 'https://www.reddit.com' + decodeEntities(permalink),
+      created_utc: createdUtc,
+      thumbnail: thumb ? decodeEntities(thumb).replace(/^\/\//, 'https://') : '',
       category
     })
   }
-  return posts
+
+  return { posts, count: tags.length, lastFullname, oldestUtc }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-function fetchFlair(subreddit, flair) {
-  const url = 'https://www.reddit.com/r/' + subreddit + '/search.rss?q=' +
-    encodeURIComponent(flair.query) + '&sort=new&restrict_sr=on&t=day&limit=100'
+function fetchPage(subreddit, after) {
+  const url = 'https://old.reddit.com/r/' + subreddit + '/new/?limit=100' +
+    (after ? '&after=' + after : '')
 
   return new Promise((resolve) => {
     exec(
-      `curl -sS -w "\\nHTTP_STATUS:%{http_code}" --max-time 8 -H "User-Agent: ${UA}" "${url}"`,
-      { encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 },
+      `curl -sS -w "\\nHTTP_STATUS:%{http_code}" --max-time 15 -H "User-Agent: ${UA}" "${url}"`,
+      { encoding: 'utf8', timeout: 20000, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
-          console.error('Failed: ' + subreddit + '/' + flair.category + ' - ' + (stderr || err.message).substring(0, 300))
+          console.error('Failed: ' + subreddit + ' - ' + (stderr || err.message).substring(0, 300))
           return resolve(null)
         }
-        const raw = stdout
-        const statusMatch = raw.match(/HTTP_STATUS:(\d+)/)
+        const statusMatch = stdout.match(/HTTP_STATUS:(\d+)/)
         const status = statusMatch ? statusMatch[1] : 'unknown'
-        const body = raw.replace(/\nHTTP_STATUS:\d+$/, '')
+        const body = stdout.replace(/\nHTTP_STATUS:\d+$/, '')
         if (status !== '200') {
-          console.error('HTTP ' + status + ' for ' + subreddit + '/' + flair.category + ': ' + body.substring(0, 200))
+          console.error('HTTP ' + status + ' for ' + subreddit + ': ' + body.substring(0, 200))
           return resolve(null)
         }
-        try {
-          const posts = parseAtomEntries(body, flair.category)
-          console.log('OK: ' + subreddit + '/' + flair.category + ' — ' + posts.length + ' posts')
-          resolve(posts)
-        } catch (parseErr) {
-          console.error('Parse error: ' + subreddit + '/' + flair.category + ' - ' + parseErr.message)
-          resolve(null)
-        }
+        resolve(body)
       }
     )
   })
 }
 
-// Reddit soft-throttles bursts of search requests by returning a valid but
-// EMPTY feed with HTTP 200 — indistinguishable from "no posts today". So:
-// requests run sequentially with spacing (never as a concurrent burst), and an
-// empty result is retried with backoff just like a failed one. A flair that is
-// genuinely empty costs two extra polite requests; a throttled one recovers.
-async function fetchFlairWithRetry(subreddit, flair) {
-  const delays = [0, 5000, 15000]
-  let last = null
+// A 200 with no parseable posts is a throttle/anti-bot artifact, not an empty
+// subreddit — treat it like a failure and retry with backoff.
+async function fetchPageWithRetry(subreddit, after, flairMap) {
+  const delays = [0, 10000, 30000]
   for (const delay of delays) {
     if (delay) {
-      console.log('Retrying ' + subreddit + '/' + flair.category + ' in ' + delay / 1000 + 's (empty or failed)')
+      console.log('Retrying ' + subreddit + ' in ' + delay / 1000 + 's (empty or failed)')
       await sleep(delay)
     }
-    last = await fetchFlair(subreddit, flair)
-    if (last && last.length > 0) return last
+    const html = await fetchPage(subreddit, after)
+    if (html) {
+      const parsed = parseListing(html, flairMap)
+      if (parsed.count > 0) return parsed
+      console.error('Parsed 0 posts for ' + subreddit + ' (HTTP 200 but no listing)')
+    }
   }
-  return last
+  return null
 }
 
+// Fetch /new pages until the listing reaches past the 24h window (usually one
+// page; r/kpop sometimes needs two on busy days).
 async function fetchSubreddit(subreddit) {
-  const flairs = FLAIR_MAP[subreddit]
-  const results = []
-  for (const flair of flairs) {
-    results.push(await fetchFlairWithRetry(subreddit, flair))
-    // Randomized gap between requests so the sequence has no fixed rhythm.
+  const flairMap = FLAIR_MAP[subreddit]
+  const cutoff = Math.floor(Date.now() / 1000) - WINDOW_SECONDS
+  const posts = []
+  let after = ''
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const parsed = await fetchPageWithRetry(subreddit, after, flairMap)
+    if (!parsed) {
+      // Page 1 failing means we got nothing: total failure. A later page
+      // failing just truncates coverage — keep what we have and let the
+      // carryover merge backfill from the previous file.
+      if (page === 1) return { posts: null }
+      console.error('Page ' + page + ' failed for ' + subreddit + ' — keeping partial listing')
+      break
+    }
+    posts.push(...parsed.posts.filter((p) => p.created_utc >= cutoff))
+    console.log('OK: ' + subreddit + ' page ' + page + ' — ' + parsed.count + ' posts scanned, ' +
+      posts.length + ' matched so far')
+    if (parsed.oldestUtc < cutoff || !parsed.lastFullname || parsed.count < 100) break
+    after = parsed.lastFullname
     await sleep(800 + Math.floor(Math.random() * 1900))
   }
 
-  // A category is "suspect" when every query feeding it came back failed or
-  // empty — main() then carries over recent existing posts instead of wiping it.
-  const categoryHits = {}
-  flairs.forEach((flair, i) => {
-    const got = results[i] !== null && results[i].length > 0
-    categoryHits[flair.category] = categoryHits[flair.category] || got
-  })
-  const emptyCategories = Object.keys(categoryHits).filter(c => !categoryHits[c])
-
-  // If nothing at all came back, treat it as a total failure even when every
-  // response was a "successful" empty feed — a full throttle must not stamp
-  // the data as fresh, or --if-stale would suppress retries for 12h.
-  const allFailed = emptyCategories.length === Object.keys(categoryHits).length
-  if (allFailed) console.error('All fetches failed or empty for r/' + subreddit)
-
-  const seen = new Set()
-  const posts = []
-  for (const group of results) {
-    if (!group) continue
-    for (const post of group) {
-      if (!seen.has(post.url)) {
-        seen.add(post.url)
-        posts.push(post)
-      }
-    }
-  }
-
-  return { posts, allFailed, emptyCategories }
+  return { posts }
 }
 
 async function main() {
   const dataDir = path.join(import.meta.dirname, '..', 'docs', 'data')
   await fs.mkdir(dataDir, { recursive: true })
 
-  const subreddits = Object.keys(FLAIR_MAP)
-
   let anyTotalFailure = false
-  for (const subreddit of subreddits) {
-    const { posts, allFailed, emptyCategories } = await fetchSubreddit(subreddit)
+  for (const subreddit of Object.keys(FLAIR_MAP)) {
+    const { posts } = await fetchSubreddit(subreddit)
     const filePath = path.join(dataDir, subreddit + '.json')
-    if (allFailed) {
+    if (posts === null) {
       anyTotalFailure = true
-      console.error('Skipped ' + filePath + ' (all flairs failed — keeping existing)')
+      console.error('Skipped ' + filePath + ' (fetch failed — keeping existing)')
       continue
     }
 
-    // Carry over still-recent existing posts for categories the search came
-    // back empty on. A post under 24h old that we fetched earlier would still
-    // match the t=day search if it were working — so an empty result there is
-    // a throttle artifact, not a real "nothing new".
-    if (emptyCategories.length > 0) {
-      const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600
-      try {
-        const existing = JSON.parse(await fs.readFile(filePath, 'utf8'))
-        let carried = 0
-        for (const post of existing.posts) {
-          if (emptyCategories.includes(post.category) && post.created_utc >= cutoff &&
-              !posts.some(p => p.url === post.url)) {
-            posts.push(post)
-            carried++
-          }
+    // Merge still-recent posts from the previous file that this listing no
+    // longer shows (fell past a failed page, or removed from /new). Keeps a
+    // truncated fetch from silently dropping posts we already had.
+    const cutoff = Math.floor(Date.now() / 1000) - WINDOW_SECONDS
+    try {
+      const existing = JSON.parse(await fs.readFile(filePath, 'utf8'))
+      let carried = 0
+      for (const post of existing.posts) {
+        if (post.created_utc >= cutoff && !posts.some((p) => p.url === post.url)) {
+          posts.push(post)
+          carried++
         }
-        if (carried > 0) console.log('Carried over ' + carried + ' existing posts for empty categories (' + emptyCategories.join(', ') + ')')
-      } catch { /* no existing file — nothing to carry over */ }
-    }
+      }
+      if (carried > 0) console.log('Carried over ' + carried + ' existing posts for ' + subreddit)
+    } catch { /* no existing file — nothing to carry over */ }
 
+    posts.sort((a, b) => b.created_utc - a.created_utc)
     const data = { fetched_at: Date.now(), posts }
     await fs.writeFile(filePath, JSON.stringify(data))
     console.log('Wrote ' + filePath + ' (' + posts.length + ' posts)')
+
+    await sleep(800 + Math.floor(Math.random() * 1900))
   }
 
-  // Exit non-zero if any subreddit had every flair fail, so update.sh logs the
+  // Exit non-zero if any subreddit failed outright, so update.sh logs the
   // failure instead of silently reporting "no changes".
   if (anyTotalFailure) process.exit(2)
 }
